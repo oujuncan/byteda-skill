@@ -1,6 +1,6 @@
 ---
 name: byteda
-description: 一句话生成专业设计物料。Use this skill for any visual design generation or editing task — posters, marketing long images, social media graphics, infographics, PPT decks, comic strips, invitations, daily-sign cards, recruitment posters, WeChat covers, and interactive H5 apps. Route all design-asset creation, reference-image-based generation, and iterative design edits through 百搭 ByteDa's MCP service. Trigger on requests like 海报/poster, 长图, 社媒图文/小红书配图, 科普图/infographic, PPT, 条漫, 邀请函, 日签, 招聘海报, 公众号封面, H5/小程序页面, or any mention of ByteDa/百搭.
+description: 百搭 ByteDa AI 设计平台——一句话生成或编辑专业设计物料，经 ByteDa MCP 服务完成，支持参考图生成与迭代修改。适用于海报/poster、营销长图、社媒图文/小红书、科普图/infographic、PPT、条漫、邀请函、日签、招聘海报、公众号封面、可交互 H5/APPLICATION 及图片画布。Trigger on any such design-asset creation/edit request, or any mention of ByteDa/百搭.
 ---
 
 # ByteDa 百搭 — 一句话生成专业设计物料
