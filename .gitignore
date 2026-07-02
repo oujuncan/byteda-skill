@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local secrets / config
+.byteda/
+config.json
+*.token
+
+# Generated outputs
+outputs/
+*.local

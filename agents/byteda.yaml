@@ -1,0 +1,29 @@
+name: byteda
+description: >-
+  一句话生成专业设计物料。Generate posters, marketing long images, social-media
+  graphics, infographics, PPT decks, comic strips, invitations, daily-sign
+  cards, recruitment posters, WeChat covers, and interactive H5 apps through the
+  百搭 ByteDa MCP service. Use for any visual design-asset creation, reference-image
+  based generation, or iterative design editing.
+
+# This skill is self-contained: it invokes scripts/byteda_cli.py, which calls the
+# ByteDa MCP JSON-RPC endpoint over HTTP. No MCP server needs to be configured in
+# the host client.
+
+skill: ../SKILL.md
+
+entrypoint:
+  command: python
+  args:
+    - scripts/byteda_cli.py
+
+env:
+  # MCP access token (mcp_...). Create one at https://byteda.net (设置 → MCP 令牌).
+  # Provide via this env var, or pass --token / --token-env on the command line,
+  # or store it in ~/.byteda/config.json.
+  BYTEDA_TOKEN: ${BYTEDA_TOKEN}
+  # Optional. Defaults to production https://api.byteda.net/byte-da/mcp
+  # BYTEDA_BASE_URL: https://api.byteda.net/byte-da/mcp
+
+defaults:
+  timeout: 300
