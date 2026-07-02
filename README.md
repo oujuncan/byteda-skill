@@ -143,8 +143,10 @@ directly:
 
 - `generate` uses SSE streaming by default, printing progress (`[10%]…[95%]`) to stderr in
   real time; it typically takes 1-3 minutes. Add `--no-stream` to fall back to a single
-  synchronous request. Configure a long enough timeout (the script defaults to 300s;
-  `--timeout 0` disables the limit).
+  synchronous request. Configure a long enough timeout (the script defaults to 1200s;
+  `--timeout 0` disables the limit). On disconnect the CLI reports the side — `[客户端断开]`
+  (local `--timeout` elapsed) vs `[服务端断开]` (upstream/server ended the stream; the job
+  may still finish server-side).
 - Each `generate` consumes credits; the exact amount is in the returned
   `cost.consume_points` (gift credits are spent first). Iterative edits are cheaper than the
   first generation.
@@ -153,6 +155,17 @@ directly:
 - `upload` is capped at 8MB by default (`--max-mb` to adjust); the entire base64 string
   rides inside the JSON-RPC body, so use the platform's multipart upload for large files.
 - Tokens expire after 30 days by default; recreate them on the platform once expired.
+
+## Changelog
+
+### v1.0.3
+
+- Default `--timeout` raised from 300s to 1200s so long/complex generations no longer get
+  cut off client-side by default.
+- On an interrupted SSE stream the CLI now reports which side dropped: `[客户端断开]`
+  (local `--timeout` elapsed — the server job may still be running) vs `[服务端断开]`
+  (upstream/server ended the stream, gracefully or reset). Retry or `--no-stream` guidance
+  is included in the message.
 
 ## License
 

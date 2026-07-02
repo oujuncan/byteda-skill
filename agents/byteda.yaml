@@ -24,4 +24,4 @@ env:
   # BYTEDA_BASE_URL: https://api.byteda.net/byte-da/mcp
 
 defaults:
-  timeout: 300
+  timeout: 1200

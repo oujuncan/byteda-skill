@@ -155,7 +155,7 @@ python "<skill-dir>/scripts/byteda_cli.py" files --file-id abc123 --file-id def4
 - `set-token`: `<API_KEY>` (positional; omit to fall back to global `--token`); honors
   `--token-env` to target a different env var name. Writes/overwrites the export line in
   the shell profile (`~/.zshrc` / `~/.bashrc` / `~/.profile` per `$SHELL`).
-- Global: `--base-url`, `--token`, `--token-env`, `--timeout` (default 300, `0` = no
+- Global: `--base-url`, `--token`, `--token-env`, `--timeout` (default 1200, `0` = no
   limit), `--raw` (print the full JSON-RPC response, no envelope unwrapping)
 
 > **Token safety:** prefer `--token-env` or `~/.byteda/config.json` over `--token`; a
@@ -224,17 +224,22 @@ The script raises on any failure (it never silently falls back). Map the message
 | `令牌无效` / `已禁用` / `HTTP 401` | Token wrong, disabled, or revoked | Ask the user to recreate an API Key at https://byteda.net (头像 → API Key → 新建 API Key) |
 | `已过期` | Token past its 30-day expiry | Same — recreate the token |
 | `积分不足` / `points` | Not enough credits | Tell the user to top up; do not retry |
-| `SSE 流结束但未收到最终结果` | Stream dropped before final response | Retry once, or add `--no-stream` |
-| `请求失败` / timeout | Network / proxy cut the connection | Retry; for long jobs ensure timeout ≥300s |
+| `[客户端断开] 读取超时` | Local `--timeout` elapsed before new data; the client closed the connection. The server job may still be running | Raise `--timeout` (`0` = no limit) or add `--no-stream`; the asset may finish server-side |
+| `[服务端断开] SSE 流已正常结束（EOF）…` | Stream closed cleanly before the final result (upstream/server ended the stream early) | Retry, or add `--no-stream`; the job may already be done server-side |
+| `[服务端断开] SSE 连接被中途中断` | Connection reset / response truncated by server or network | Retry once, or add `--no-stream` |
+| `请求失败` / timeout | Network / proxy cut the connection | Retry; for long jobs ensure timeout ≥1200s |
 | `未知 appType` | Bad `--app-type` value | Pick from `H5`/`APPLICATION`/`IMAGE` (`app-types` command) |
 | `未知 scene` | Bad `--scene` value | Pick an H5 scene from the `scenes` command; only valid with `appType=H5` |
 | `超过 base64 上传上限` | File too large for base64 upload | Use platform multipart upload, or raise `--max-mb` if truly needed |
 
 ## Notes & failure rules
 
-- `generate` streams over SSE by default (1-3 min typical). Keep the shell/tool timeout
-  longer than the job; script default is 300s, `--timeout 0` disables it. `--no-stream`
-  forces a single synchronous request (no progress, more prone to proxy cutoffs).
+- `generate` streams over SSE by default (1-3 min typical, complex jobs longer). Keep the
+  shell/tool timeout longer than the job; script default is 1200s, `--timeout 0` disables
+  it. `--no-stream` forces a single synchronous request (no progress, more prone to proxy
+  cutoffs). On disconnect the CLI tells you the side: `[客户端断开]` (local timeout — raise
+  `--timeout`) vs `[服务端断开]` (upstream/server ended the stream — the job may still finish
+  server-side, retry or use `--no-stream`).
 - Each `generate` consumes credits; the amount is in `cost.consume_points` (gift credits
   are spent first via `gift_consume_points`). Iterative edits cost less than first builds.
 - `upload` (base64) suits small files and is capped at 8MB by default (`--max-mb` to

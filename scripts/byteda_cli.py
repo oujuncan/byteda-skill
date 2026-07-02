@@ -35,10 +35,12 @@ from __future__ import annotations
 
 import argparse
 import base64
+import http.client
 import json
 import mimetypes
 import os
 import re
+import socket
 import sys
 import time
 import urllib.error
@@ -53,7 +55,7 @@ _URL_RE = re.compile(r"https?://[^\s\"'()<>]+", re.IGNORECASE)
 DEFAULT_BASE_URL = "https://api.byteda.net/byte-da/mcp"
 DEFAULT_TOKEN_ENV = "BYTEDA_TOKEN"
 CONFIG_PATH = Path.home() / ".byteda" / "config.json"
-DEFAULT_TIMEOUT = 300
+DEFAULT_TIMEOUT = 1200
 # base64 上传上限（原始字节，MB）。base64 后体积约 +33%，整串走 JSON-RPC body，
 # 服务端 base64 路径无大小校验，大文件请改用平台 multipart 上传。
 DEFAULT_UPLOAD_MAX_MB = 8
@@ -267,11 +269,27 @@ def _rpc_sse_tool(base_url, token, name, arguments, timeout, on_progress) -> dic
                 continue
             if "id" in msg and ("result" in msg or "error" in msg):
                 final = msg  # final JSON-RPC response, keep reading until stream ends
+    except (socket.timeout, TimeoutError) as exc:
+        # 客户端断开：--timeout 秒内未收到新数据，socket 读超时，连接由本地主动关闭。
+        raise BytedaError(
+            f"[客户端断开] 读取超时：{timeout}s 内未收到新数据，连接由客户端主动断开。"
+            "服务端任务可能仍在继续生成，可加大 --timeout（0 表示不限）或改用 --no-stream。"
+        ) from exc
+    except (http.client.IncompleteRead, ConnectionError) as exc:
+        # 服务端断开（异常）：连接被重置或响应未读完，服务端/上游中途掐断。
+        raise BytedaError(
+            f"[服务端断开] SSE 连接被中途中断（{type(exc).__name__}）。"
+            "服务端任务可能仍在继续生成，请稍后重试或改用 --no-stream。"
+        ) from exc
     finally:
         resp.close()
 
     if final is None:
-        raise BytedaError("SSE 流结束但未收到最终结果，请重试或加 --no-stream")
+        # 服务端断开（优雅）：流已正常 EOF，但结束前没发最终结果（上游/服务端提前关流）。
+        raise BytedaError(
+            "[服务端断开] SSE 流已正常结束（EOF），但未收到最终结果。"
+            "服务端任务可能已完成或仍在继续，请稍后重试或改用 --no-stream。"
+        )
     return _check_rpc_error(final)
 
 
