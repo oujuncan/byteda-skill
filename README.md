@@ -1,172 +1,101 @@
-**English** | [简体中文](README.zh-CN.md)
+[English](README.en.md) | **简体中文**
 
 # ByteDa Skill
 
-Generate professional design assets from a single sentence — posters, marketing long
-images, social-media graphics, infographics, PPT decks, comic strips, invitations,
-daily-sign cards, recruitment posters, WeChat covers, interactive H5, image canvases, and
-more. The AI handles everything from copywriting to layout in one shot. Output is organized
-into 3 top-level types (`H5` / `APPLICATION` / `IMAGE`); under `H5` an additional `scene`
-splits into 11 concrete design categories.
+一句话生成设计物料：海报、营销长图、社媒图文、科普图、PPT、条漫、H5 页面，以及单张图片、短视频、配音 / 音色克隆。
 
-This is an Agent Skill for the [ByteDa](https://byteda.net) MCP service. It ships a
-self-contained CLI script that depends only on the Python standard library and calls
-ByteDa's MCP JSON-RPC endpoint directly — **no** MCP server needs to be configured in the
-host client.
+这是 [百搭 ByteDa](https://byteda.net) 的 Agent Skill，可装进 Claude Code、Codex、Cursor 等支持 Skill 的 AI 编程工具。
+自带的 `scripts/byteda.py` 只依赖 Python 标准库，直接调用百搭 MCP 服务，宿主**不需要**配置 MCP。
 
-## Layout
+## 目录
 
 ```
 byteda/
-├── SKILL.md                 # Skill spec (the main file the agent reads)
-├── README.md                # This file (English)
-├── README.zh-CN.md          # Chinese
-├── LICENSE                  # MIT
-├── .gitignore
-├── agents/
-│   └── byteda.yaml          # Agent definition
-└── scripts/
-    └── byteda_cli.py        # Self-contained CLI (stdlib-only)
+├── SKILL.md            # 给 Agent 读的技能说明（路由、流程、失败处理）
+├── scripts/byteda.py   # 零依赖 CLI（Python 3.8+）
+├── agents/byteda.yaml  # Agent 运行时入口定义
+├── README.md / README.en.md
+└── LICENSE
 ```
 
-## Prerequisites
+## 安装
 
-- Python 3.8+
-- A ByteDa API Key (starts with `mcp_`). See "Getting an API Key" below.
-
-## Getting an API Key
-
-After logging in at https://byteda.net, create and copy an API Key as follows:
-
-1. **Click your avatar** — the user avatar in the bottom-left corner.
-2. **Click "API Key"** — in the popup menu (Account Settings / My Orders / My Credits /
-   **API Key** / Log Out).
-3. **Click "+ New API Key"** — top-right of the API Key page.
-4. **Choose a workspace** — in the dialog, pick which workspace the Key belongs to (defaults
-   to "the workspace of your phone number"). The API Key is bound to that workspace; the
-   works it generates and the credits it consumes all belong to that workspace.
-5. **Enter a Key name** — to distinguish multiple Keys, e.g. `cherry-studio`, `claude-code`.
-6. **Click "Confirm"** — to finish creating it.
-7. **Click copy** — find the newly created Key (starts with `mcp_…`) in the list, click the
-   copy button in the API Key column, and paste the full Key into the config below.
-
-> ⚠️ Once created, the Key is shown in plaintext in the list. Keep it safe — do not commit it
-> to a repository or expose it in client-side code. If the platform detects that a Key has
-> been publicly leaked, it may automatically rotate or invalidate it. To revoke a Key, click
-> "Delete" in the "Actions" column of the list.
-
-## Configuring the token
-
-Pick any one method (highest priority first):
-
-1. Pass it once on the command line: `--token mcp_xxx`
-2. Environment variable: `export BYTEDA_TOKEN=mcp_xxx` (the script reads this by default)
-3. Config file `~/.byteda/config.json`:
-
-   ```json
-   {
-     "token": "mcp_xxx",
-     "base_url": "https://api.byteda.net/byte-da/mcp"
-   }
-   ```
-
-`base_url` is optional and defaults to the production endpoint
-`https://api.byteda.net/byte-da/mcp`; to target a self-hosted or test environment, override
-it with `--base-url` or the `BYTEDA_BASE_URL` environment variable.
-
-## Quick start
+把整个目录放进宿主的 skills 目录：
 
 ```bash
-# List the top-level appTypes (3) and H5 scenes (11)
-python scripts/byteda_cli.py app-types
-python scripts/byteda_cli.py scenes
-
-# Generate a recruitment poster (H5 + scene)
-python scripts/byteda_cli.py generate \
-  --prompt "Recruiting a front-end engineer, company XX Tech, salary 15-25K, location Beijing" \
-  --app-type H5 --scene RECRUITMENT
-
-# Upload an asset, then generate based on it
-python scripts/byteda_cli.py upload --file ./logo.png        # -> fileId
-python scripts/byteda_cli.py generate --prompt "Product long image using the brand colors" --file-id <fileId>
-
-# Query design styles and generate with a chosen style
-python scripts/byteda_cli.py styles --name "商务"            # -> style id
-python scripts/byteda_cli.py generate --prompt "Year-end summary PPT" --app-type H5 --scene PPT --style-id <id>
-
-# Iterate (reuse the appId returned last time)
-python scripts/byteda_cli.py generate --app-id 12345 --prompt "Enlarge the title, switch to warm tones"
-
-# Generate and download the result locally (HTML + image assets bundled together,
-# openable offline; the directory is created automatically)
-python scripts/byteda_cli.py generate --prompt "Summer sale long image, everything 50% off" --out ./outputs/sale.html
-# Produces outputs/sale.html and outputs/sale_assets/ (image assets); add --no-assets to save HTML only
+# Claude Code（用户级）
+git clone https://github.com/oujuncan/byteda-skill.git ~/.claude/skills/byteda
+# Codex
+git clone https://github.com/oujuncan/byteda-skill.git ~/.agents/skills/byteda
 ```
 
-## Installing as an Agent Skill
+升级：进入目录后 `git pull`。
 
-Place the `byteda/` directory under your agent's skills directory, e.g.:
+## 获取并配置 API Key
 
-- Claude Code: `~/.claude/skills/byteda/` or, per-project, `.claude/skills/byteda/`
+1. 登录 https://byteda.net，左下角**头像 → API Key → 新建 API Key**，选择 Key 归属的空间（产物和积分消耗都记在这个空间）。
+2. 复制 Key，执行：
 
-The agent reads the `SKILL.md` frontmatter (`name` / `description`) to decide when to
-trigger, and follows the workflow in it to invoke `scripts/byteda_cli.py`.
-
-## Connecting as an MCP server directly (optional)
-
-If your client natively supports MCP, you can skip the script and configure the server
-directly:
-
-```json
-{
-  "mcpServers": {
-    "byteda": {
-      "type": "streamable-http",
-      "url": "https://api.byteda.net/byte-da/mcp",
-      "headers": { "Authorization": "Bearer mcp_xxx" }
-    }
-  }
-}
+```bash
+python3 ~/.claude/skills/byteda/scripts/byteda.py login <API_KEY>
+# 不想让 Key 进 shell 历史，就从 stdin 输入：
+python3 ~/.claude/skills/byteda/scripts/byteda.py login -
 ```
 
-## Tool overview
+`login` 会先校验 Key，再写入 `~/.byteda/config.json`（权限 0600）。读取优先级：`--token` > 环境变量 `BYTEDA_TOKEN` > 配置文件。
+执行 `byteda.py doctor` 可查看当前生效的 Key 来源和剩余积分。
 
-| CLI subcommand | MCP tool | Description |
-|----------------|----------|-------------|
-| `generate` | `generate_app` | Generate / iterate a design asset; returns appId, url, cost |
-| `upload` | `upload_file_base64` | Upload a local file as a reference asset |
-| `styles` | `query_styles` | Paginated query of design styles |
-| `style` | `get_style` | Full detail of a single style |
-| `files` | `get_files` | Query details of uploaded files |
+> **从 v1 升级**：v1 的 `set-token` 会把 Key 以 `export BYTEDA_TOKEN=…` 的形式写进 `~/.zshrc` / `~/.bashrc`，
+> 它的优先级高于配置文件。`login` 检测到后会提示具体的文件和行号，请手动删除那一行，然后重开终端。
 
-## Notes
+## 用法
 
-- `generate` uses SSE streaming by default, printing progress (`[10%]…[95%]`) to stderr in
-  real time; it typically takes 1-3 minutes. Add `--no-stream` to fall back to a single
-  synchronous request. Configure a long enough timeout (the script defaults to 1200s;
-  `--timeout 0` disables the limit). On disconnect the CLI reports the side — `[客户端断开]`
-  (local `--timeout` elapsed) vs `[服务端断开]` (upstream/server ended the stream; the job
-  may still finish server-side).
-- Each `generate` consumes credits; the exact amount is in the returned
-  `cost.consume_points` (gift credits are spent first). Iterative edits are cheaper than the
-  first generation.
-- `--token` shows up in the process list / shell history — prefer the `BYTEDA_TOKEN`
-  environment variable or `~/.byteda/config.json` (recommend `chmod 600`).
-- `upload` is capped at 8MB by default (`--max-mb` to adjust); the entire base64 string
-  rides inside the JSON-RPC body, so use the platform's multipart upload for large files.
-- Tokens expire after 30 days by default; recreate them on the platform once expired.
+一般不用手动敲命令，直接对 Agent 说"帮我做一张咖啡店开业海报"即可。手动调用示例：
 
-## Changelog
+```bash
+S=~/.claude/skills/byteda/scripts/byteda.py
+python3 $S image --prompt "咖啡店开业海报，暖棕色调" --ratio 3:4 --ref ./logo.png --out ./outputs
+python3 $S video --prompt "小猫转头看向镜头" --ref first_frame:./cat.png --duration 5
+python3 $S audio --text "欢迎光临" --speaker zh_female_vv_uranus_bigtts
+python3 $S h5    --requirement "开业活动长图：品牌故事、招牌饮品、优惠" --scene LONG_IMAGE
+python3 $S brief --prompt "按这份方案做一套开业物料" --ref ./plan.pdf
+python3 $S wait <taskId>
+```
 
-### v1.0.3
+完整命令列表见 `byteda.py --help`；服务端全部工具可以用 `byteda.py tools` 查看，用 `byteda.py call <工具> '<json>'` 直接调用。
 
-- Default `--timeout` raised from 300s to 1200s so long/complex generations no longer get
-  cut off client-side by default.
-- On an interrupted SSE stream the CLI now reports which side dropped: `[客户端断开]`
-  (local `--timeout` elapsed — the server job may still be running) vs `[服务端断开]`
-  (upstream/server ended the stream, gracefully or reset). Retry or `--no-stream` guidance
-  is included in the message.
+### 行为约定
 
-## License
+- 生成类命令默认阻塞到任务结束，stdout 输出一个 JSON 结果，stderr 输出进度。`--no-wait` 只提交不等待。
+- 每次提交都会自动生成幂等键并回显。遇到网络中断时，带上同一个 `--idempotency-key` 重跑，不会重复扣费。
+- 本地等待超时（默认 1200 秒，`--timeout 0` 表示不限）不会中断服务端任务，用 `wait <taskId>` 可以继续等。
+- 空间并发任务满了（`QUEUE_LIMIT_EXCEEDED`）时，脚本自动排队重试，最多等 10 分钟。
+- 退出码：`0` 完成 · `1` 失败 · `2` 参数错误 · `3` 仍在运行 · `4` 需要补充信息 · `5` Key 缺失或无效。
+
+## 不想用脚本？直接配置 MCP
+
+支持远程 MCP 的客户端（Claude Code、Cursor、Codex、Cherry Studio 等）也可以直接接入：
+
+```bash
+claude mcp add --transport http byteda https://api.byteda.net/byte-da/mcp \
+  --header "Authorization: Bearer <API_KEY>"
+```
+
+> 注意：Claude Code 新版会严格校验 `tools/list`，服务端修复（`resultType` 字段）上线前可能显示 `tools fetch failed`，这种情况请先用脚本方式。
+
+区别：直连 MCP 时，上传要自己完成三步直传，任务要靠模型自己轮询；用本技能的脚本，这两件事都一条命令搞定。
+
+## 从 v1 迁移
+
+| v1 | v2 |
+|---|---|
+| `byteda_cli.py generate --app-type H5 --scene X` | `byteda.py h5 --scene X`，或 `byteda.py brief` |
+| `generate --app-type IMAGE` | `byteda.py image` |
+| `generate --app-type APPLICATION` | 已下线，改用 `brief` |
+| `upload --file`（base64，≤8MB） | `upload` 或 `--ref`（预签名直传：图片 15MB / 视频 50MB / 音频 20MB / 文档 50MB） |
+| `set-token`（写入 shell profile） | `login`（写入 `~/.byteda/config.json`，0600） |
+| SSE 长连接等待 | 提交后轮询，支持 `wait` 续等和幂等重提 |
+
+## 许可
 
 MIT
