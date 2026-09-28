@@ -15,7 +15,9 @@ description: 百搭 ByteDa AI 设计平台——一句话生成设计物料：�
 - `<skill-dir>` 指本 SKILL.md 所在目录。统一这样调用：`python3 <skill-dir>/scripts/byteda.py <命令> ...`
   （Windows 上用 `python`）。
 - stdout 只有一个 JSON 结果，stderr 是进度。生成类命令会阻塞到任务结束（图片约 1 分钟，
-  视频 / H5 / brief 常见 2~5 分钟），**把宿主的命令超时设到 20 分钟以上**。
+  视频 / H5 / brief 常见 2~5 分钟）。脚本默认最多耗时 540 秒，到时就返回退出码 `3`。
+  **宿主的命令超时设成 10 分钟**（比如 Claude Code 的 Bash 最大值 600000 ms），要比脚本的预算长，
+  不然进程会被宿主直接杀掉，一个字都拿不到。
 - 退出码：`0` 完成 · `1` 失败 · `2` 参数错误 · `3` 仍在运行 · `4` 需要补充信息 · `5` 缺少或无效 API Key。
 
 ## 第一步：确认 API Key
@@ -33,7 +35,7 @@ description: 百搭 ByteDa AI 设计平台——一句话生成设计物料：�
 | 用户要的是 | 命令 | 说明 |
 |---|---|---|
 | 一张图（海报、封面、插画、商品图、Logo） | `image` | 最快，可事前估价。多张就调多次 |
-| 一段短视频、让图片动起来 | `video` | 首帧 / 尾帧用 `--ref first_frame:…` / `last_frame:…` |
+| 一段短视频、让图片动起来 | `video` | 首帧 / 尾帧用 `--ref first_frame:…` / `last_frame:…`；角色参考用 `character:…` |
 | 配音、旁白、音色克隆 | `audio` | 音色 ID 查 `models --type AUDIO`；克隆用 `--ref reference_voice:…` |
 | 排版型页面：长图、PPT、社媒图文、科普图、条漫 | `h5` | 带 `--scene`，取值见下表 |
 | 一整套物料、说不清要哪几种产物、需要读文档（pdf/docx 等） | `brief` | 服务端 Agent 自己拆解，可能产出多个产物 |
@@ -95,14 +97,14 @@ python3 $S call <工具名> '<json>'    # 兜底：调用上面没有封装的�
 
 | 返回 | 含义 | 怎么做 |
 |---|---|---|
-| 退出码 `3`，`status=RUNNING` | 本地等待超时，服务端**还在跑** | `byteda.py wait <taskId>` 继续等，**不要重新提交** |
-| 报错里带 `--idempotency-key xxx` | 网络断了，不确定提交成功没有 | 原命令加上 `--idempotency-key xxx` 重跑，服务端会返回原任务，不会重复扣费 |
+| 退出码 `3`，`status=RUNNING` | 本地时间预算用完，服务端**还在跑** | `byteda.py wait <taskId>` 继续等，**不要重新提交**；可以反复 `wait` |
+| 报错里有 `rerunWith` | 网络或网关出错，不确定提交成功没有 | 原命令**原样**重跑，再追加 `rerunWith` 里的参数（同一个幂等键、同一个画布），服务端返回原任务，不会重复扣费 |
 | `nextAction=retry` | 可以重试 | 先问用户；重试时**不要**带旧幂等键（带了只会拿回同一个失败结果），或者用 `--node-id` 在原节点上重跑 |
 | `nextAction=use_previous_artifact` | 画布保留了旧产物 | 不要重试，说明情况 |
 | `nextAction=give_up` | 不可重试 | 把 `error` 原样告诉用户 |
 | 退出码 `4`，`questions` | 仅 `brief --allow-clarification` 会出现 | 向用户问清问题，把答案并进 prompt，带同一 `--app-id` 再调 `brief` |
 | 退出码 `5` | Key 无效、禁用或过期 | 让用户重新创建 Key 后 `login` |
 | `INSUFFICIENT_POINTS` / 积分不足 | 余额不够 | 告诉用户去充值，不要重试 |
-| `QUEUE_LIMIT_EXCEEDED` | 空间并发任务满了，脚本已自动排队 10 分钟仍没有空位 | 等前面的任务结束再提交；批量出图时一次别并行太多 |
+| `QUEUE_LIMIT_EXCEEDED` / `APP_BUSY` / `RATE_LIMITED` | 空间并发满了、这块画布上已有任务在跑、或请求太频繁；脚本在时间预算内已经自动重试过 | 等前面的任务结束再提交，同一块画布上一次只跑一个 `brief`；批量出图时别一次并行太多 |
 
 不要编造产物地址；服务端返回什么错误，就原样告诉用户。

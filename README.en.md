@@ -43,9 +43,12 @@ python3 $S wait <taskId>
 
 - Generation commands block until the task finishes and print one JSON object on stdout
   (progress on stderr). `--no-wait` submits only.
-- Every submission gets an idempotency key; re-run with the same `--idempotency-key` after a
-  network failure without being charged twice. A local timeout never cancels the server task —
-  resume with `wait <taskId>`.
+- Every command has a total time budget (default 540s, incl. upload and queueing; keep it below
+  your host's command timeout). Running out never cancels the server task — exit code 3, resume
+  with `wait <taskId>`.
+- Busy responses (queue full / canvas busy / rate limited) are retried automatically within the
+  budget. On a gateway 502/503/504 or network error the output carries `rerunWith`: re-run the same
+  command with those flags to get the original task back without being charged twice.
 - Exit codes: `0` done · `1` failed · `2` usage · `3` still running · `4` needs input · `5` auth.
 - `byteda.py tools` lists every server tool; `byteda.py call <tool> '<json>'` calls any of them.
 

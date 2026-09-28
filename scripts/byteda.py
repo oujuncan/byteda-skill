@@ -18,10 +18,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import mimetypes
 import os
 import re
+import shutil
 import stat
 import sys
 import tempfile
@@ -32,30 +34,52 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 DEFAULT_BASE_URL = "https://api.byteda.net/byte-da/mcp"
 PROTOCOL_VERSION = "2026-07-28"
 META_VERSION_KEY = "io.modelcontextprotocol/protocolVersion"
 API_KEY_PAGE = "https://byteda.net/api-key"
-DEFAULT_WAIT_TIMEOUT = 1200
-QUEUE_WAIT_MAX = 600
-QUEUE_RETRY_INTERVAL = 15
+# 每条命令的总时间预算（上传 + 排队 + 等待）。必须低于宿主的命令超时——Claude Code 的 Bash
+# 最长 10 分钟，被宿主杀掉时 stdout 什么都没有，模型拿不到 taskId 只能重新提交、重复扣费
+DEFAULT_TIMEOUT = 540
+UNLIMITED_BUSY_WAIT = 1800
+BUSY_RETRY_INTERVAL = 15
+# 服务端标记 retryable 的「暂时忙」：提交前就被拒，没建任务也没扣费，可用同一幂等键重提
+BUSY_ERROR_CODES = {"QUEUE_LIMIT_EXCEEDED", "APP_BUSY", "RATE_LIMITED"}
+# 网关层的瞬时故障；请求可能已经到达后端，只能当「结果未知」处理
+TRANSIENT_HTTP_CODES = {502, 503, 504}
+MAX_REF_DOWNLOAD_BYTES = 50 * 1024 * 1024
 
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_RUNNING, EXIT_NEEDS_INPUT, EXIT_AUTH = 0, 1, 2, 3, 4, 5
 
-# 服务端 references.role 的全部取值；--ref 用「role:目标」前缀时据此识别，避免把 https: / C: 误当 role
-KNOWN_ROLES = {
-    "reference", "first_frame", "last_frame", "avatar", "source", "first_clip",
-    "audio", "driving_audio", "reference_voice",
+# 各命令接受的 references.role，与服务端 inputSchema 的 enum 保持一致（提交前本地校验，避免白传文件）
+COMMAND_ROLES = {
+    "image": {"reference"},
+    "video": {"reference", "first_frame", "last_frame", "sequence", "character", "avatar",
+              "audio", "driving_audio", "reference_voice"},
+    "audio": {"reference", "reference_voice"},
+    "h5": {"reference", "first_frame", "last_frame", "source", "first_clip", "avatar",
+           "audio", "driving_audio", "reference_voice"},
+    "brief": {"reference", "first_frame", "last_frame", "source", "first_clip", "avatar",
+              "audio", "driving_audio", "reference_voice"},
 }
+# --ref 用「role:目标」前缀时据此识别，避免把 https: / C: 误当 role
+KNOWN_ROLES = set().union(*COMMAND_ROLES.values())
 
 # mimetypes 在各平台上缺的扩展名补齐；服务端会校验 MIME 与扩展名同类
 EXTRA_MIME = {
     ".webp": "image/webp", ".heic": "image/heic", ".heif": "image/heif",
     ".m4v": "video/x-m4v", ".mkv": "video/x-matroska", ".webm": "video/webm",
     ".m4a": "audio/mp4", ".aac": "audio/aac", ".opus": "audio/opus", ".flac": "audio/flac",
-    ".ogg": "audio/ogg", ".md": "text/markdown", ".csv": "text/csv",
+    ".ogg": "audio/ogg", ".md": "text/markdown", ".csv": "text/csv", ".txt": "text/plain",
+    ".htm": "text/html", ".html": "text/html", ".pdf": "application/pdf",
+    ".doc": "application/msword", ".ppt": "application/vnd.ms-powerpoint",
+    ".xls": "application/vnd.ms-excel",
+    # 精简容器 / 老版本 Python 的 mimetypes 表里没有 OOXML，回落成 octet-stream 会被服务端拒
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 }
 
 FILE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
@@ -204,14 +228,17 @@ class McpClient:
                 content_type = resp.headers.get("Content-Type", "")
         except urllib.error.HTTPError as err:
             detail = err.read().decode("utf-8", "replace")[:300]
+            if err.code in TRANSIENT_HTTP_CODES:
+                raise NetworkError("网关暂时不可用（HTTP %d）" % err.code) from err
             if err.code in (401, 403):
                 message = "API Key 无效、已禁用或已过期（HTTP %d，令牌 %s 来自 %s）。请到 %s 重新创建后执行 login。" % (
                     err.code, mask(self.token), self.token_source or "--token", API_KEY_PAGE)
                 warning = env_token_warning(load_config().get("token")) if self.token_source.startswith("环境变量") else None
                 raise CliError(message + (warning or ""), EXIT_AUTH)
             raise CliError("服务端返回 HTTP %d：%s" % (err.code, detail))
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as err:
-            raise NetworkError("网络请求失败：%s" % getattr(err, "reason", err)) from err
+        except (OSError, http.client.HTTPException) as err:
+            # OSError 覆盖 URLError / socket.timeout（3.8~3.9 不是 TimeoutError）/ ssl.SSLError / 连接重置
+            raise NetworkError("网络请求失败：%s" % (getattr(err, "reason", None) or err or type(err).__name__)) from err
 
         message = self._parse(raw, content_type)
         if "error" in message:
@@ -274,6 +301,20 @@ def _content_json(result: dict):
     return None
 
 
+def call_when_free(client: McpClient, tool: str, arguments: dict, deadline: float | None):
+    """调工具；遇到服务端「暂时忙」（并发满 / 画布正忙 / 频控）就等一会儿重试，直到预算用完。"""
+    stop = deadline or time.time() + UNLIMITED_BUSY_WAIT
+    while True:
+        try:
+            return client.call(tool, arguments)
+        except CliError as err:
+            if isinstance(err, NetworkError) or err.payload.get("errorCode") not in BUSY_ERROR_CODES \
+                    or time.time() + BUSY_RETRY_INTERVAL >= stop:
+                raise
+            log("服务端暂时忙（%s），%ds 后重试……" % (err.payload.get("errorCode"), BUSY_RETRY_INTERVAL))
+            time.sleep(BUSY_RETRY_INTERVAL)
+
+
 def strip_empty(data: dict) -> dict:
     """去掉 None / 空串 / 空列表，服务端不接受空值占位。"""
     return {k: v for k, v in data.items() if v is not None and v != "" and v != [] and v != {}}
@@ -286,16 +327,17 @@ def guess_mime(path: Path) -> str:
     return EXTRA_MIME.get(ext) or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
 
 
-def upload_file(client: McpClient, path: Path, app_id: str | None = None) -> dict:
+def upload_file(client: McpClient, path: Path, app_id: str | None = None, deadline: float | None = None) -> dict:
     if not path.is_file():
-        raise CliError("文件不存在：%s" % path, EXIT_USAGE)
+        raise CliError("文件不存在：%s（role 前缀写法为 role:路径，可用 role：%s）"
+                       % (path, "、".join(sorted(KNOWN_ROLES))), EXIT_USAGE)
     data = path.read_bytes()
-    session = client.call("create_upload_session", strip_empty({
+    session = call_when_free(client, "create_upload_session", strip_empty({
         "fileName": path.name,
         "sizeBytes": len(data),
         "mimeType": guess_mime(path),
         "appId": app_id,
-    }))
+    }), deadline)
     method = (session.get("method") or "PUT").upper()
     url = session["uploadUrl"]
     if method == "POST":
@@ -308,8 +350,8 @@ def upload_file(client: McpClient, path: Path, app_id: str | None = None) -> dic
             resp.read()
     except urllib.error.HTTPError as err:
         raise CliError("直传对象存储失败 HTTP %d：%s" % (err.code, err.read().decode("utf-8", "replace")[:300]))
-    except (urllib.error.URLError, TimeoutError, ConnectionError) as err:
-        raise CliError("直传对象存储失败：%s" % getattr(err, "reason", err))
+    except (OSError, http.client.HTTPException) as err:
+        raise CliError("直传对象存储失败：%s" % (getattr(err, "reason", None) or err))
     done = client.call("complete_upload", {
         "uploadId": session["uploadId"],
         "sha256": hashlib.sha256(data).hexdigest(),
@@ -332,18 +374,34 @@ def _multipart(fields: dict, file_name: str, mime: str, data: bytes):
     return b"".join(parts), "multipart/form-data; boundary=" + boundary
 
 
-def download_to_temp(url: str) -> Path:
-    """把公网素材下载到临时文件，供只接受 fileId 的原子任务上传。"""
+def known_suffix(name: str) -> bool:
+    ext = Path(name).suffix.lower()
+    return bool(ext) and (ext in EXTRA_MIME or mimetypes.guess_type("x" + ext)[0] is not None)
+
+
+def download_to_temp(url: str, directory: Path) -> Path:
+    """把公网素材下载到临时目录，供需要 fileId 的场景上传。无后缀的签名链接按 Content-Type 补扩展名。"""
     name = Path(urllib.parse.urlparse(url).path).name or "reference"
-    target = Path(tempfile.mkdtemp(prefix="byteda-")) / name
     try:
         with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "byteda-skill"}),
                                     timeout=120) as resp:
-            target.write_bytes(resp.read())
-    except (urllib.error.URLError, TimeoutError, ConnectionError) as err:
-        raise CliError("下载参考素材失败：%s（%s）" % (url, getattr(err, "reason", err)))
-    if not target.suffix:
-        raise CliError("URL 没有文件后缀，无法判断素材类型，请先下载到本地并带上扩展名：%s" % url, EXIT_USAGE)
+            length = int(resp.headers.get("Content-Length") or 0)
+            if length > MAX_REF_DOWNLOAD_BYTES:
+                raise CliError("参考素材超过 50 MiB：%s" % url, EXIT_USAGE)
+            data = resp.read(MAX_REF_DOWNLOAD_BYTES + 1)
+            content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+    except (OSError, http.client.HTTPException) as err:
+        raise CliError("下载参考素材失败：%s（%s）" % (url, getattr(err, "reason", None) or err))
+    if len(data) > MAX_REF_DOWNLOAD_BYTES:
+        raise CliError("参考素材超过 50 MiB：%s" % url, EXIT_USAGE)
+    if not known_suffix(name):
+        ext = {v: k for k, v in EXTRA_MIME.items()}.get(content_type) or mimetypes.guess_extension(content_type)
+        if not ext:
+            raise CliError("无法判断素材类型（URL 无后缀且 Content-Type=%s），请下载到本地并带上扩展名：%s"
+                           % (content_type or "空", url), EXIT_USAGE)
+        name = Path(name).stem + ext
+    target = directory / name
+    target.write_bytes(data)
     return target
 
 
@@ -355,24 +413,36 @@ def parse_ref(spec: str):
     return None, spec
 
 
-def resolve_refs(client: McpClient, specs, app_id: str | None, allow_url: bool) -> list:
-    """把 --ref 列表转成服务端 references。allow_url=True 时 URL 原样透传（仅 design_brief 支持）。"""
+def resolve_refs(client: McpClient, specs, command: str, app_id: str | None, deadline: float | None) -> list:
+    """把 --ref 列表转成服务端 references。
+
+    只有 brief 能直接收 URL，且 URL 带可识别后缀时才透传（服务端按后缀推断类型，推断不出直接报错）；
+    其余情况一律下载后上传换 fileId，由服务端按真实内容判定类型。
+    """
+    parsed = [parse_ref(spec) for spec in specs or []]
+    allowed = COMMAND_ROLES[command]
+    for role, _ in parsed:
+        if role and role not in allowed:
+            raise CliError("%s 不接受 role=%s，可用：%s" % (command, role, "、".join(sorted(allowed))), EXIT_USAGE)
     refs = []
-    for spec in specs or []:
-        role, target = parse_ref(spec)
-        entry = {}
-        if target.startswith(("http://", "https://")):
-            if allow_url:
-                entry["url"] = target
+    scratch = Path(tempfile.mkdtemp(prefix="byteda-"))
+    try:
+        for role, target in parsed:
+            entry = {}
+            if target.startswith(("http://", "https://")):
+                if command == "brief" and known_suffix(urllib.parse.urlparse(target).path):
+                    entry["url"] = target
+                else:
+                    entry["fileId"] = upload_file(client, download_to_temp(target, scratch), app_id, deadline)["fileId"]
+            elif FILE_ID_PATTERN.match(target) and not Path(target).exists():
+                entry["fileId"] = target
             else:
-                entry["fileId"] = upload_file(client, download_to_temp(target), app_id)["fileId"]
-        elif FILE_ID_PATTERN.match(target) and not Path(target).exists():
-            entry["fileId"] = target
-        else:
-            entry["fileId"] = upload_file(client, Path(target).expanduser(), app_id)["fileId"]
-        if role:
-            entry["role"] = role
-        refs.append(entry)
+                entry["fileId"] = upload_file(client, Path(target).expanduser(), app_id, deadline)["fileId"]
+            if role:
+                entry["role"] = role
+            refs.append(entry)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
     return refs
 
 
@@ -390,20 +460,14 @@ def ensure_canvas(client: McpClient, args, fallback_name: str) -> tuple:
 def submit(client: McpClient, tool: str, arguments: dict, args) -> dict:
     key = args.idempotency_key or "bd-" + uuid.uuid4().hex
     arguments["idempotencyKey"] = key
-    deadline = time.time() + min(args.timeout or QUEUE_WAIT_MAX, QUEUE_WAIT_MAX)
-    while True:
-        try:
-            submitted = client.call(tool, strip_empty(arguments))
-            break
-        except NetworkError as err:
-            raise CliError("%s。任务可能已提交，请用同一个幂等键重跑本命令（不会重复扣费）：--idempotency-key %s"
-                           % (err, key), EXIT_FAILED, {"idempotencyKey": key})
-        except CliError as err:
-            # 空间并发已满是提交前的拒绝，没有建任务也没扣费；排队等前面的任务让出名额
-            if err.payload.get("errorCode") != "QUEUE_LIMIT_EXCEEDED" or args.no_wait or time.time() >= deadline:
-                raise
-            log("空间并发任务已满，%ds 后重新提交……" % QUEUE_RETRY_INTERVAL)
-            time.sleep(QUEUE_RETRY_INTERVAL)
+    app_id = arguments.get("appId")
+    try:
+        submitted = call_when_free(client, tool, strip_empty(arguments), None if args.no_wait else args.deadline)
+    except NetworkError as err:
+        # 结果未知：必须带回同一幂等键和同一画布重跑，否则会重复扣费、或在新空画布上拿回旧任务
+        rerun = "--idempotency-key %s" % key + (" --app-id %s" % app_id if app_id else "")
+        raise CliError("%s。任务可能已经提交成功，请原样重跑本命令并追加：%s（不会重复扣费）" % (err, rerun),
+                       EXIT_FAILED, strip_empty({"idempotencyKey": key, "appId": app_id, "rerunWith": rerun}))
     submitted["idempotencyKey"] = key
     if submitted.get("duplicated"):
         log("幂等键命中，拿回之前提交的同一个任务 taskId=%s（不会重复扣费）" % submitted.get("taskId"))
@@ -414,7 +478,7 @@ def submit(client: McpClient, tool: str, arguments: dict, args) -> dict:
     return submitted
 
 
-def wait_task(client: McpClient, task_id: str, timeout: float, interval_hint: int | None = None) -> dict:
+def wait_task(client: McpClient, task_id: str, deadline: float | None, interval_hint: int | None = None) -> dict:
     start = time.time()
     interval = max(2, min(interval_hint or 5, 15))
     failures = 0
@@ -441,7 +505,7 @@ def wait_task(client: McpClient, task_id: str, timeout: float, interval_hint: in
         if node_state != last_state or elapsed - last_logged >= 30:
             log("[%3ds] 生成中 %s" % (elapsed, node_state))
             last_state, last_logged = node_state, elapsed
-        if timeout and elapsed >= timeout:
+        if deadline and time.time() + interval >= deadline:
             status["hint"] = ("本地等待超时，服务端任务仍在运行且不会因此中断。继续等待：byteda.py wait %s" % task_id)
             return status
         interval = max(2, min(status.get("pollIntervalSeconds") or interval, 15))
@@ -458,7 +522,8 @@ def summarize(status: dict, extra: dict | None = None) -> dict:
         "nodeId": status.get("nodeId"),
         "kind": status.get("kind"),
     }
-    for key in ("url", "canvasUrl", "width", "height", "durationSeconds", "htmlLength", "artifacts", "assistant"):
+    for key in ("url", "canvasUrl", "width", "height", "durationSec", "htmlLength",
+                "artifacts", "assistant", "assistantTruncated", "note"):
         if result.get(key) not in (None, "", []):
             out[key] = result[key]
     if status.get("cost"):
@@ -476,7 +541,10 @@ def summarize(status: dict, extra: dict | None = None) -> dict:
         out["hint"] = NEXT_ACTION_HINTS[action]
     if status.get("hint"):
         out["hint"] = status["hint"]
-    out.update({k: v for k, v in (extra or {}).items() if v not in (None, "")})
+    # 服务端返回的字段优先，本地补充信息只填空缺
+    for k, v in (extra or {}).items():
+        if v not in (None, "") and k not in out:
+            out[k] = v
     return strip_empty(out)
 
 
@@ -487,15 +555,21 @@ def finish(client: McpClient, submitted: dict, args, extra: dict | None = None) 
         emit(strip_empty({**submitted, **extra,
                           "hint": "任务已提交，用 byteda.py wait %s 获取结果" % submitted.get("taskId")}))
         return EXIT_OK
-    status = wait_task(client, submitted["taskId"], args.timeout, submitted.get("pollIntervalSeconds"))
-    return report(status, args, extra)
+    status = wait_task(client, submitted["taskId"], args.deadline, submitted.get("pollIntervalSeconds"))
+    return report(client, status, args, extra)
 
 
-def report(status: dict, args, extra: dict | None = None) -> int:
+def report(client: McpClient, status: dict, args, extra: dict | None = None) -> int:
     if getattr(args, "raw", False):
         emit(status)
     else:
         out = summarize(status, extra)
+        if out.get("appId") and not out.get("canvasUrl"):
+            # brief 结果与「带 --app-id 迭代」时都没有画布地址，补查一次；失败不影响主结果
+            try:
+                out["canvasUrl"] = client.call("get_canvas", {"appId": out["appId"]}).get("canvasUrl")
+            except CliError:
+                pass
         if status.get("status") == "DONE" and getattr(args, "out", None):
             out["downloaded"] = download_outputs(out, Path(args.out))
         emit(out)
@@ -561,7 +635,7 @@ def cmd_doctor(args, client_factory) -> int:
 def cmd_image(args, client_factory) -> int:
     client = client_factory()
     app_id, canvas_url = ensure_canvas(client, args, args.prompt)
-    refs = [{**r, "role": "reference"} for r in resolve_refs(client, args.ref, app_id, allow_url=False)]
+    refs = resolve_refs(client, args.ref, "image", app_id, args.deadline)
     submitted = submit(client, "create_image_task", {
         "appId": app_id, "nodeId": args.node_id, "prompt": args.prompt,
         "aspectRatio": args.ratio, "resolution": args.resolution,
@@ -575,7 +649,7 @@ def cmd_image(args, client_factory) -> int:
 def cmd_video(args, client_factory) -> int:
     client = client_factory()
     app_id, canvas_url = ensure_canvas(client, args, args.prompt)
-    refs = resolve_refs(client, args.ref, app_id, allow_url=False)
+    refs = resolve_refs(client, args.ref, args.command, app_id, args.deadline)
     submitted = submit(client, "create_video_task", {
         "appId": app_id, "nodeId": args.node_id, "prompt": args.prompt,
         "durationSeconds": args.duration, "aspectRatio": args.ratio, "resolution": args.resolution,
@@ -588,7 +662,7 @@ def cmd_video(args, client_factory) -> int:
 def cmd_audio(args, client_factory) -> int:
     client = client_factory()
     app_id, canvas_url = ensure_canvas(client, args, args.text)
-    refs = resolve_refs(client, args.ref, app_id, allow_url=False)
+    refs = resolve_refs(client, args.ref, args.command, app_id, args.deadline)
     submitted = submit(client, "create_audio_task", {
         "appId": app_id, "nodeId": args.node_id, "prompt": args.text, "speaker": args.speaker,
         "language": args.language, "references": refs, "model": args.model,
@@ -599,7 +673,7 @@ def cmd_audio(args, client_factory) -> int:
 def cmd_h5(args, client_factory) -> int:
     client = client_factory()
     app_id, canvas_url = ensure_canvas(client, args, args.requirement)
-    refs = resolve_refs(client, args.ref, app_id, allow_url=False)
+    refs = resolve_refs(client, args.ref, args.command, app_id, args.deadline)
     submitted = submit(client, "create_h5_task", {
         "appId": app_id, "requirement": args.requirement, "scene": args.scene,
         "width": args.width, "height": args.height, "references": refs,
@@ -609,7 +683,7 @@ def cmd_h5(args, client_factory) -> int:
 
 def cmd_brief(args, client_factory) -> int:
     client = client_factory()
-    refs = resolve_refs(client, args.ref, args.app_id, allow_url=True)
+    refs = resolve_refs(client, args.ref, "brief", args.app_id, args.deadline)
     submitted = submit(client, "design_brief", {
         "prompt": args.prompt, "appId": args.app_id, "conversationId": args.conversation_id,
         "appName": args.name, "styleIds": args.style_id, "references": refs,
@@ -622,12 +696,12 @@ def cmd_brief(args, client_factory) -> int:
 
 def cmd_wait(args, client_factory) -> int:
     client = client_factory()
-    return report(wait_task(client, args.task_id, args.timeout), args)
+    return report(client, wait_task(client, args.task_id, args.deadline), args)
 
 
 def cmd_status(args, client_factory) -> int:
     client = client_factory()
-    return report(client.call("get_task_status", {"taskId": args.task_id}), args)
+    return report(client, client.call("get_task_status", {"taskId": args.task_id}), args)
 
 
 def cmd_upload(args, client_factory) -> int:
@@ -719,8 +793,9 @@ def build_parser() -> argparse.ArgumentParser:
                       help="参考素材，可重复；本地文件自动上传。ROLE 如 first_frame、reference_voice")
     task.add_argument("--idempotency-key", help="幂等键；超时重跑时传入上次回显的值，不会重复扣费")
     task.add_argument("--no-wait", action="store_true", help="只提交不等待，返回 taskId")
-    task.add_argument("--timeout", type=float, default=DEFAULT_WAIT_TIMEOUT,
-                      help="本地最长等待秒数（默认 %d，0 表示不限）" % DEFAULT_WAIT_TIMEOUT)
+    task.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
+                      help="本条命令总耗时预算秒数，含上传与排队（默认 %d，须小于宿主命令超时；0 表示不限）"
+                           % DEFAULT_TIMEOUT)
     task.add_argument("--out", help="完成后把产物下载到该目录")
     task.add_argument("--raw", action="store_true", help="输出服务端原始任务状态")
 
@@ -791,7 +866,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("wait", parents=[common], help="等待已提交的任务结束")
     p.add_argument("task_id")
-    p.add_argument("--timeout", type=float, default=DEFAULT_WAIT_TIMEOUT)
+    p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     p.add_argument("--out")
     p.add_argument("--raw", action="store_true")
     p.set_defaults(func=cmd_wait)
@@ -858,8 +933,17 @@ def main(argv=None) -> int:
         except (AttributeError, ValueError):
             pass
     args = build_parser().parse_args(argv)
-    if getattr(args, "timeout", None) == 0 and args.command != "call":
-        args.timeout = None
+    # call 的 --timeout 是单次请求超时；其余命令的是整条命令的截止时间
+    timeout = getattr(args, "timeout", None) if args.command != "call" else None
+    args.deadline = time.time() + timeout if timeout else None
+
+    # role 写错要在建画布、上传之前就拦下，否则会留下空画布和白传的文件
+    if args.command in COMMAND_ROLES:
+        allowed = COMMAND_ROLES[args.command]
+        for role, _ in (parse_ref(spec) for spec in getattr(args, "ref", None) or []):
+            if role and role not in allowed:
+                emit({"error": "%s 不接受 role=%s，可用：%s" % (args.command, role, "、".join(sorted(allowed)))})
+                return EXIT_USAGE
 
     def client_factory() -> McpClient:
         token, source = resolve_token(args)

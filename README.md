@@ -33,7 +33,7 @@ git clone https://github.com/oujuncan/byteda-skill.git ~/.agents/skills/byteda
 
 ## 获取并配置 API Key
 
-1. 登录 https://byteda.net，左下角**头像 → API Key → 新建 API Key**，选择 Key 归属的空间（产物和积分消耗都记在这个空间）。
+1. 登录 [byteda.net](https://byteda.net)，点左下角 **头像 → API Key → 新建 API Key**，选择 Key 归属的空间（产物和积分消耗都记在这个空间）。
 2. 复制 Key，执行：
 
 ```bash
@@ -68,8 +68,10 @@ python3 $S wait <taskId>
 
 - 生成类命令默认阻塞到任务结束，stdout 输出一个 JSON 结果，stderr 输出进度。`--no-wait` 只提交不等待。
 - 每次提交都会自动生成幂等键并回显。遇到网络中断时，带上同一个 `--idempotency-key` 重跑，不会重复扣费。
-- 本地等待超时（默认 1200 秒，`--timeout 0` 表示不限）不会中断服务端任务，用 `wait <taskId>` 可以继续等。
-- 空间并发任务满了（`QUEUE_LIMIT_EXCEEDED`）时，脚本自动排队重试，最多等 10 分钟。
+- 每条命令有总耗时预算（默认 540 秒，包括上传、排队和等待；`--timeout 0` 表示不限），预算要比宿主的命令超时短。
+  用完预算时服务端任务不会中断，退出码为 3，用 `wait <taskId>` 可以继续等。
+- 空间并发满、画布正忙、请求太频繁这几种情况，服务端还没建任务、也没扣费，脚本会在预算内自动重试。
+- 网关出现 502/503/504 或网络中断时，报错里会给出 `rerunWith`：原样重跑命令并追加这段参数，就能拿回原任务，不会重复扣费。
 - 退出码：`0` 完成 · `1` 失败 · `2` 参数错误 · `3` 仍在运行 · `4` 需要补充信息 · `5` Key 缺失或无效。
 
 ## 不想用脚本？直接配置 MCP
